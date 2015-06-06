@@ -7,6 +7,7 @@ import (
 	"github.com/buildkite/agent/retry"
 	"github.com/buildkite/agent/signalwatcher"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -33,50 +34,62 @@ func (r *AgentPool) Start() error {
 	// call, at which point we get back a real agent.
 	template := r.CreateAgentTemplate()
 
-	logger.Info("Registering agent with Buildkite...")
+	var waitGroup sync.WaitGroup
 
-	// Register the agent
-	registered, err := r.RegisterAgent(template)
-	if err != nil {
-		logger.Fatal("%s", err)
+	for i := 0; i < 10; i++ {
+		waitGroup.Add(1)
+
+		go func() {
+			logger.Info("Registering agent with Buildkite...")
+
+			// Register the agent
+			registered, err := r.RegisterAgent(template)
+			if err != nil {
+				logger.Fatal("%s", err)
+			}
+
+			logger.Info("Successfully registered agent \"%s\" with meta-data %s", registered.Name, registered.MetaData)
+
+			// Now that we have a registereted agent, we can connect it to the API,
+			// and start running jobs.
+			worker := AgentWorker{Agent: registered, AgentConfiguration: r.AgentConfiguration, Endpoint: r.Endpoint}.Create()
+
+			logger.Info("Connecting to Buildkite...")
+			if err := worker.Connect(); err != nil {
+				logger.Fatal("%s", err)
+			}
+
+			logger.Info("Agent successfully connected")
+			logger.Info("You can press Ctrl-C to stop the agent")
+			logger.Info("Waiting for work...")
+
+			// Now that the agent has connected, we need to start the signal
+			// watcher so in the event of a QUIT signal, we can gracefully
+			// disconnect the agent.
+			signalwatcher.Watch(func(sig signalwatcher.Signal) {
+				if sig == signalwatcher.QUIT {
+					logger.Debug("Received signal `%s`", sig.String())
+					worker.Stop()
+				} else {
+					logger.Debug("Ignoring signal `%s`", sig.String())
+				}
+			})
+
+			// Starts the agent worker. This will block until the agent has
+			// finished or is stopped.
+			if err := worker.Start(); err != nil {
+				logger.Fatal("%s", err)
+			}
+
+			// Now that the agent has stopped, we can disconnect it
+			logger.Info("Disconnecting %s...", worker.Agent.Name)
+			worker.Disconnect()
+
+			waitGroup.Done()
+		}()
 	}
 
-	logger.Info("Successfully registered agent \"%s\" with meta-data %s", registered.Name, registered.MetaData)
-
-	// Now that we have a registereted agent, we can connect it to the API,
-	// and start running jobs.
-	worker := AgentWorker{Agent: registered, AgentConfiguration: r.AgentConfiguration, Endpoint: r.Endpoint}.Create()
-
-	logger.Info("Connecting to Buildkite...")
-	if err := worker.Connect(); err != nil {
-		logger.Fatal("%s", err)
-	}
-
-	logger.Info("Agent successfully connected")
-	logger.Info("You can press Ctrl-C to stop the agent")
-	logger.Info("Waiting for work...")
-
-	// Now that the agent has connected, we need to start the signal
-	// watcher so in the event of a QUIT signal, we can gracefully
-	// disconnect the agent.
-	signalwatcher.Watch(func(sig signalwatcher.Signal) {
-		if sig == signalwatcher.QUIT {
-			logger.Debug("Received signal `%s`", sig.String())
-			worker.Stop()
-		} else {
-			logger.Debug("Ignoring signal `%s`", sig.String())
-		}
-	})
-
-	// Starts the agent worker. This will block until the agent has
-	// finished or is stopped.
-	if err := worker.Start(); err != nil {
-		logger.Fatal("%s", err)
-	}
-
-	// Now that the agent has stopped, we can disconnect it
-	logger.Info("Disconnecting %s...", worker.Agent.Name)
-	worker.Disconnect()
+	waitGroup.Wait()
 
 	return nil
 }
