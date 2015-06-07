@@ -36,7 +36,7 @@ func (r *AgentPool) Start() error {
 
 	var waitGroup sync.WaitGroup
 
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 5; i++ {
 		waitGroup.Add(1)
 
 		go func() {
