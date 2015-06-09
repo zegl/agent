@@ -8,7 +8,7 @@ import (
 	"github.com/buildkite/agent/retry"
 	"os"
 	"path/filepath"
-	_ "regexp"
+	"sync"
 	"time"
 )
 
@@ -39,6 +39,9 @@ type JobRunner struct {
 
 	// If the job is being cancelled
 	cancelled bool
+
+	// Used to wait on various routines that we spin up
+	wg sync.WaitGroup
 }
 
 // Initializes the job runner
@@ -71,13 +74,15 @@ func (r JobRunner) Create() (runner *JobRunner, err error) {
 func (r *JobRunner) Run() error {
 	logger.Info("Starting job %s", r.Job.ID)
 
-	// Start the log streamer
-	if err := r.logStreamer.Start(); err != nil {
+	// Start the build in the Buildkite Agent API. This is the first thing
+	// we do so if it fails, we don't have to worry about cleaning things
+	// up like started log streamer workers, etc.
+	if err := r.startJob(time.Now()); err != nil {
 		return err
 	}
 
-	// Start the build in the Buildkite Agent API
-	if err := r.startJob(time.Now()); err != nil {
+	// Start the log streamer
+	if err := r.logStreamer.Start(); err != nil {
 		return err
 	}
 
@@ -94,7 +99,7 @@ func (r *JobRunner) Run() error {
 	finishedAt := time.Now()
 
 	// Wait until all the header times have finished uploading
-	logger.Debug("[HeaderTimes] Waiting for all times to finish uploading")
+	logger.Debug("Waiting for header times to finish uploading")
 
 	r.headerTimesStreamer.Wait()
 
@@ -109,6 +114,10 @@ func (r *JobRunner) Run() error {
 
 	// Finish the build in the Buildkite Agent API
 	r.finishJob(finishedAt, r.process.ExitStatus, int(r.logStreamer.ChunksFailedCount))
+
+	// Wait for the routines that we spun up to finish
+	logger.Debug("Waiting for all other routines to finish")
+	r.wg.Wait()
 
 	logger.Info("Finished job %s", r.Job.ID)
 
@@ -167,7 +176,10 @@ func (r *JobRunner) createEnvironment() []string {
 	return envSlice
 }
 
-// Starts the job in the Buildkite Agent API
+// Starts the job in the Buildkite Agent API. We don't bother retrying with
+// this call, because if it fails, the agent will just go get another job to
+// work on (which may be the same job, at which point it will try to start it
+// again)
 func (r *JobRunner) startJob(startedAt time.Time) error {
 	r.Job.StartedAt = startedAt.UTC().Format(time.RFC3339Nano)
 	_, _, err := r.APIClient.Jobs.Start(r.Job)
@@ -183,9 +195,23 @@ func (r *JobRunner) finishJob(finishedAt time.Time, exitStatus string, failedChu
 	r.Job.ChunksFailedCount = failedChunkCount
 
 	return retry.Do(func(s *retry.Stats) error {
-		_, _, err := r.APIClient.Jobs.Finish(r.Job)
+		_, response, err := r.APIClient.Jobs.Finish(r.Job)
 		if err != nil {
-			logger.Warn("%s (%s)", err, s)
+			// If the API returns with a 422, that means that we
+			// succesfully tried to finish the job, but Buildkite
+			// rejected the finish for some reason. This can
+			// sometimes mean that Buildkite has cancelled the job
+			// before we get a chance to send the final API call
+			// (maybe this agent took too long to kill the
+			// process). In that case, we don't want to keep trying
+			// to finish the job forever so we'll just bail out and
+			// go find some more work to do.
+			if response.StatusCode == 422 {
+				logger.Warn("Buildkite rejected the call to finish the job (%s)", err)
+				s.Break()
+			} else {
+				logger.Warn("%s (%s)", err, s)
+			}
 		}
 
 		return err
@@ -196,6 +222,9 @@ func (r *JobRunner) onProcessStartCallback() {
 	// Start a routine that will grab the output every few seconds and send
 	// it back to Buildkite
 	go func() {
+		// Add to the wait group
+		r.wg.Add(1)
+
 		for r.process.Running {
 			// Send the output of the process to the log streamer
 			// for processing
@@ -205,11 +234,17 @@ func (r *JobRunner) onProcessStartCallback() {
 			time.Sleep(1 * time.Second)
 		}
 
+		// Mark this routine as done in the wait group
+		r.wg.Done()
+
 		logger.Debug("Routine that processes the log has finished")
 	}()
 
 	// Start a routine that will grab the output every few seconds and send it back to Buildkite
 	go func() {
+		// Add to the wait group
+		r.wg.Add(1)
+
 		for r.process.Running {
 			// Re-get the job and check it's status to see if it's been
 			// cancelled
@@ -225,6 +260,9 @@ func (r *JobRunner) onProcessStartCallback() {
 			// Check for cancellations every few seconds
 			time.Sleep(3 * time.Second)
 		}
+
+		// Mark this routine as done in the wait group
+		r.wg.Done()
 
 		logger.Debug("Routine that refreshes the job has finished")
 	}()
@@ -247,8 +285,7 @@ func (r *JobRunner) onUploadHeaderTime(cursor int, total int, times map[string]s
 // interval before giving up.
 func (r *JobRunner) onUploadChunk(chunk *LogStreamerChunk) error {
 	return retry.Do(func(s *retry.Stats) error {
-		_, err := r.APIClient.Chunks.Upload(&api.Chunk{
-			Job:      r.Job,
+		_, err := r.APIClient.Chunks.Upload(r.Job.ID, &api.Chunk{
 			Data:     chunk.Data,
 			Sequence: chunk.Order,
 		})
