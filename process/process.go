@@ -255,7 +255,9 @@ func (p *Process) Output() string {
 	return p.buffer.String()
 }
 
-func (p *Process) Kill() error {
+// Kill the process. If supported by the operating system it is initially signaled for termination
+// and then forcefully killed after the provided grace period.
+func (p *Process) Kill(gracePeriod time.Duration) error {
 	var err error
 	if runtime.GOOS == "windows" {
 		// Sending Interrupt on Windows is not implemented.
@@ -307,11 +309,11 @@ func (p *Process) Kill() error {
 		c <- 1
 	}()
 
-	// Timeout this process after 3 seconds
+	// Timeout this process after grace period
 	select {
 	case _ = <-c:
 		// Was successfully terminated
-	case <-time.After(10 * time.Second):
+	case <-time.After(gracePeriod):
 		// Stop checking in the routine above
 		checking = false
 

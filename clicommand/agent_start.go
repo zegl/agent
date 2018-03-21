@@ -44,6 +44,7 @@ type AgentStartConfig struct {
 	Priority                  string   `cli:"priority"`
 	DisconnectAfterJob        bool     `cli:"disconnect-after-job"`
 	DisconnectAfterJobTimeout int      `cli:"disconnect-after-job-timeout"`
+	CancelGracePeriod         int      `cli:"cancel-grace-period"`
 	BootstrapScript           string   `cli:"bootstrap-script" normalize:"filepath"`
 	BuildPath                 string   `cli:"build-path" normalize:"filepath" validate:"required"`
 	HooksPath                 string   `cli:"hooks-path" normalize:"filepath"`
@@ -152,6 +153,12 @@ var AgentStartCommand = cli.Command{
 			Value:  120,
 			Usage:  "When --disconnect-after-job is specified, the number of seconds to wait for a job before shutting down",
 			EnvVar: "BUILDKITE_AGENT_DISCONNECT_AFTER_JOB_TIMEOUT",
+		},
+		cli.IntFlag{
+			Name:   "cancel-grace-period",
+			Value:  10,
+			Usage:  "The number of seconds running processes are given to gracefully terminate before they are killed when a job is cancelled",
+			EnvVar: "BUILDKITE_CANCEL_GRACE_PERIOD",
 		},
 		cli.StringFlag{
 			Name:   "shell",
@@ -365,7 +372,8 @@ var AgentStartCommand = cli.Command{
 				TimestampLines:            cfg.TimestampLines,
 				DisconnectAfterJob:        cfg.DisconnectAfterJob,
 				DisconnectAfterJobTimeout: cfg.DisconnectAfterJobTimeout,
-				Shell: cfg.Shell,
+				CancelGracePeriod:         cfg.CancelGracePeriod,
+				Shell:                     cfg.Shell,
 			},
 		}
 

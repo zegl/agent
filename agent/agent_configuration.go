@@ -16,5 +16,6 @@ type AgentConfiguration struct {
 	TimestampLines            bool
 	DisconnectAfterJob        bool
 	DisconnectAfterJobTimeout int
+	CancelGracePeriod         int
 	Shell                     string
 }
