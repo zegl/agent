@@ -31,6 +31,7 @@ type AgentPool struct {
 	WaitForEC2TagsTimeout time.Duration
 	Endpoint              string
 	AgentConfiguration    *AgentConfiguration
+	Workers               int
 
 	interruptCount int
 	signalLock     sync.Mutex
@@ -43,16 +44,32 @@ func (r *AgentPool) Start() error {
 	// Create the agent registration API Client
 	r.APIClient = APIClient{Endpoint: r.Endpoint, Token: r.Token}.Create()
 
-	// Create the agent template. We use pass this template to the register
-	// call, at which point we get back a real agent.
-	template := r.CreateAgentTemplate()
+	var wg sync.WaitGroup
 
-	logger.Info("Registering agent with Buildkite...")
+	for i := 0; i < r.Workers; i++ {
+		if r.Workers == 1 {
+			logger.Info("Registering agent with Buildkite...")
+		} else {
+			logger.Info("Registering agent %d of %d with Buildkite...", i+1, r.Workers)
+		}
 
-	// Register the agent
-	registered, err := r.RegisterAgent(template)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := r.startWorker(); err != nil {
+				logger.Fatal("%v", err)
+			}
+		}()
+	}
+
+	wg.Wait()
+	return nil
+}
+
+func (r *AgentPool) startWorker() error {
+	registered, err := r.RegisterAgent(r.CreateAgentTemplate())
 	if err != nil {
-		logger.Fatal("%s", err)
+		return err
 	}
 
 	logger.Info("Successfully registered agent \"%s\" with tags [%s]", registered.Name,
@@ -68,7 +85,7 @@ func (r *AgentPool) Start() error {
 
 	logger.Info("Connecting to Buildkite...")
 	if err := worker.Connect(); err != nil {
-		logger.Fatal("%s", err)
+		return err
 	}
 
 	logger.Info("Agent successfully connected")
@@ -104,15 +121,16 @@ func (r *AgentPool) Start() error {
 		}
 	})
 
-	// Starts the agent worker. This will block until the agent has
-	// finished or is stopped.
+	// Starts the agent worker.
 	if err := worker.Start(); err != nil {
-		logger.Fatal("%s", err)
+		return err
 	}
 
 	// Now that the agent has stopped, we can disconnect it
 	logger.Info("Disconnecting %s...", worker.Agent.Name)
-	worker.Disconnect()
+	if err := worker.Disconnect(); err != nil {
+		return err
+	}
 
 	return nil
 }
