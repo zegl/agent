@@ -273,8 +273,9 @@ var AgentStartCommand = cli.Command{
 			EnvVar: "BUILDKITE_NO_GIT_SUBMODULES,BUILDKITE_DISABLE_GIT_SUBMODULES",
 		},
 		cli.IntFlag{
-			Name:   "workers",
-			Usage:  "The number of parallel workers to run within this agent",
+			Name: "workers",
+			Usage: "The number of agent workers to run, each of which can handle a job concurrently. " +
+				"Each worker will register as a separate agent with a unique name.",
 			Value:  1,
 			EnvVar: "BUILDKITE_AGENT_WORKERS",
 		},
