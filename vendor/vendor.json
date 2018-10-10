@@ -15,6 +15,12 @@
 			"revisionTime": "2017-02-17T01:53:35Z"
 		},
 		{
+			"checksumSHA1": "fPjkJSKxgZYvGX9g50J6frwwcyo=",
+			"path": "github.com/DataDog/datadog-go/statsd",
+			"revision": "281ae9f2d8950e694e810c78daf74201d869b0d0",
+			"revisionTime": "2018-08-22T15:14:19Z"
+		},
+		{
 			"checksumSHA1": "qO2na7vGPve58xAwBJziIc+BJb4=",
 			"path": "github.com/aws/aws-sdk-go/aws",
 			"revision": "2a4034064ca5271c3f875d43012285133154d664",

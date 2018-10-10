@@ -2,7 +2,6 @@ package agent
 
 import (
 	"errors"
-	"expvar"
 	"fmt"
 	"os"
 	"runtime"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/buildkite/agent/api"
 	"github.com/buildkite/agent/logger"
+	"github.com/buildkite/agent/metrics"
 	"github.com/buildkite/agent/retry"
 	"github.com/buildkite/agent/signalwatcher"
 	"github.com/buildkite/agent/system"
@@ -32,6 +32,7 @@ type AgentPool struct {
 	WaitForEC2TagsTimeout time.Duration
 	Endpoint              string
 	AgentConfiguration    *AgentConfiguration
+	MetricsCollector      *metrics.Collector
 
 	interruptCount int
 	signalLock     sync.Mutex
@@ -63,14 +64,14 @@ func (r *AgentPool) Start() error {
 	logger.Debug("Job status interval: %ds", registered.JobStatusInterval)
 	logger.Debug("Heartbeat interval: %ds", registered.HearbeatInterval)
 
-	var start = time.Now()
-	expvar.Publish("uptime", expvar.Func(func() interface{} {
-		return int64(time.Since(start) / time.Second)
-	}))
-
 	// Now that we have a registered agent, we can connect it to the API,
 	// and start running jobs.
-	worker := AgentWorker{Agent: registered, AgentConfiguration: r.AgentConfiguration, Endpoint: r.Endpoint}.Create()
+	worker := AgentWorker{
+		Agent:              registered,
+		AgentConfiguration: r.AgentConfiguration,
+		Endpoint:           r.Endpoint,
+		MetricsCollector:   r.MetricsCollector,
+	}.Create()
 
 	logger.Info("Connecting to Buildkite...")
 	if err := worker.Connect(); err != nil {
