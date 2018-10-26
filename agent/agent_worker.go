@@ -100,9 +100,6 @@ func (a *AgentWorker) Start() error {
 				// Get the last heartbeat time to the nearest microsecond
 				lastHeartbeat := time.Unix(atomic.LoadInt64(&a.lastPing), 0)
 
-				// Track metrics
-				a.metrics.Count(`agent.heartbeat.error`, 1)
-
 				logger.Error("Failed to heartbeat %s. Will try again in %s. (Last successful was %v ago)",
 					err, heartbeatInterval, time.Now().Sub(lastHeartbeat))
 			}
@@ -251,9 +248,6 @@ func (a *AgentWorker) Heartbeat() error {
 	// Track a timestamp for the successful heartbeat for better errors
 	atomic.StoreInt64(&a.lastHeartbeat, time.Now().Unix())
 
-	// Track metrics
-	a.metrics.Count(`agent.heartbeat.success`, 1)
-
 	logger.Debug("Heartbeat sent at %s and received at %s", beat.SentAt, beat.ReceivedAt)
 	return nil
 }
@@ -282,16 +276,10 @@ func (a *AgentWorker) Ping() {
 			logger.Debug("[DisconnectionTimer] Reset back to %d seconds because of ping failure...", a.AgentConfiguration.DisconnectAfterJobTimeout)
 		}
 
-		// Track metrics
-		a.metrics.Count(`agent.ping.error`, 1)
-
 		return
 	} else {
 		// Track a timestamp for the successful ping for better errors
 		atomic.StoreInt64(&a.lastPing, time.Now().Unix())
-
-		// Track metrics
-		a.metrics.Count(`agent.ping.success`, 1)
 	}
 
 	// Should we switch endpoints?
@@ -335,9 +323,6 @@ func (a *AgentWorker) Ping() {
 
 	logger.Info("Assigned job %s. Accepting...", ping.Job.ID)
 
-	// Create tags for job metrics
-	jobMetricsScope := a.MetricsCollector.Scope(metrics.Tags{})
-
 	// Accept the job. We'll retry on connection related issues, but if
 	// Buildkite returns a 422 or 500 for example, we'll just bail out,
 	// re-ping, and try the whole process again.
@@ -352,7 +337,6 @@ func (a *AgentWorker) Ping() {
 				logger.Warn("Buildkite rejected the call to accept the job (%s)", err)
 				s.Break()
 			}
-			jobMetricsScope.Count(`jobs.accept.success`, 1)
 		}
 
 		return err
@@ -360,10 +344,16 @@ func (a *AgentWorker) Ping() {
 
 	// If `accepted` is nil, then the job was never accepted
 	if accepted == nil {
-		jobMetricsScope.Count(`jobs.accept.error`, 1)
 		logger.Error("Failed to accept job")
 		return
 	}
+
+	jobMetricsScope := a.metrics.With(metrics.Tags{
+		`pipeline`: accepted.Env[`BUILDKITE_PIPELINE_SLUG`],
+		`org`:      accepted.Env[`BUILDKITE_ORGANIZATION_SLUG`],
+		`branch`:   accepted.Env[`BUILDKITE_BRANCH`],
+		`source`:   accepted.Env[`BUILDKITE_SOURCE`],
+	})
 
 	// Now that the job has been accepted, we can start it.
 	a.jobRunner, err = JobRunner{
