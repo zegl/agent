@@ -70,7 +70,7 @@ type AgentStartConfig struct {
 	Debug                     bool     `cli:"debug"`
 	DebugHTTP                 bool     `cli:"debug-http"`
 	Experiments               []string `cli:"experiment" normalize:"list"`
-	Workers                   int      `cli:"workers"`
+	Spawn                     int      `cli:"spawn"`
 
 	/* Deprecated */
 	NoSSHFingerprintVerification bool     `cli:"no-automatic-ssh-fingerprint-verification" deprecated-and-renamed-to:"NoSSHKeyscan"`
@@ -273,10 +273,10 @@ var AgentStartCommand = cli.Command{
 			EnvVar: "BUILDKITE_NO_GIT_SUBMODULES,BUILDKITE_DISABLE_GIT_SUBMODULES",
 		},
 		cli.IntFlag{
-			Name:   "workers",
-			Usage:  "The number of workers to run. Workers will register as separate agents, with unique names, and can run different jobs in parallel.",
+			Name:   "spawn",
+			Usage:  "The number of agents to spawn in parallel",
 			Value:  1,
-			EnvVar: "BUILDKITE_AGENT_WORKERS",
+			EnvVar: "BUILDKITE_AGENT_SPAWN",
 		},
 		ExperimentsFlag,
 		EndpointFlag,
@@ -393,7 +393,7 @@ var AgentStartCommand = cli.Command{
 			TagsFromHost:          cfg.TagsFromHost,
 			WaitForEC2TagsTimeout: ec2TagTimeout,
 			Endpoint:              cfg.Endpoint,
-			Workers:               cfg.Workers,
+			Spawn:                 cfg.Spawn,
 			AgentConfiguration: &agent.AgentConfiguration{
 				BootstrapScript:           cfg.BootstrapScript,
 				BuildPath:                 cfg.BuildPath,
