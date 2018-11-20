@@ -3,7 +3,6 @@ package clicommand
 import (
 	"io/ioutil"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/buildkite/agent/stdin"
@@ -18,7 +17,7 @@ import (
 
 var AnnotateHelpDescription = `Usage:
 
-   buildkite-agent annotate <file> [arguments...]
+   buildkite-agent annotate [<body>] [arguments...]
 
 Description:
 
@@ -30,14 +29,18 @@ Description:
    - Graphs that include analysis about your codebase
    - Helpful information for team members about what happened during a build
 
-   Annotations can be written in either Markdown or HTML.
+   Annotations are written in CommonMark-compliant Markdown, with "GitHub
+   Flavored Markdown" extensions.
+
+   The annotation body can be supplied as a command line argument, or by piping
+   content into the command.
 
    You can update an existing annotation's body by running the annotate command
    again and provide the same context as the one you want to update. Or if you
    leave context blank, it will use the default context.
 
-   You can also just update the style of an existing annotation by omitting the
-   body and just providing a new style value.
+   You can also update just the style of an existing annotation by omitting the
+   body entirely and providing a new style value.
 
 Example:
 
@@ -120,9 +123,6 @@ var AnnotateCommand = cli.Command{
 
 			body = string(stdin[:])
 		}
-
-		// Trim any whitespace edges on the annotation body
-		body = strings.TrimSpace(body)
 
 		// Create the API client
 		client := agent.APIClient{

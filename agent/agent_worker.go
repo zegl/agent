@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/buildkite/agent/api"
@@ -13,11 +14,20 @@ import (
 )
 
 type AgentWorker struct {
+	// Tracks the last successful heartbeat and ping
+	// NOTE: to avoid alignment issues on ARM architectures when
+	// using atomic.StoreInt64 we need to keep this at the beginning
+	// of the struct
+	lastPing, lastHeartbeat int64
+
 	// The API Client used when this agent is communicating with the API
 	APIClient *api.Client
 
 	// The endpoint that should be used when communicating with the API
 	Endpoint string
+
+	// Whether to disable http for the API
+	DisableHTTP2 bool
 
 	// The registred agent API record
 	Agent *api.Agent
@@ -53,7 +63,11 @@ func (a AgentWorker) Create() AgentWorker {
 		endpoint = a.Endpoint
 	}
 
-	a.APIClient = APIClient{Endpoint: endpoint, Token: a.Agent.AccessToken}.Create()
+	a.APIClient = APIClient{
+		Endpoint:     endpoint,
+		Token:        a.Agent.AccessToken,
+		DisableHTTP2: a.DisableHTTP2,
+	}.Create()
 
 	return a
 }
@@ -73,7 +87,11 @@ func (a *AgentWorker) Start() error {
 		for a.running {
 			err := a.Heartbeat()
 			if err != nil {
-				logger.Error("Failed to heartbeat %s. Will try again in %s", err, heartbeatInterval)
+				// Get the last heartbeat time to the nearest microsecond
+				lastHeartbeat := time.Unix(atomic.LoadInt64(&a.lastPing), 0)
+
+				logger.Error("Failed to heartbeat %s. Will try again in %s. (Last successful was %v ago)",
+					err, heartbeatInterval, time.Now().Sub(lastHeartbeat))
 			}
 
 			time.Sleep(heartbeatInterval)
@@ -216,6 +234,9 @@ func (a *AgentWorker) Heartbeat() error {
 		return err
 	}
 
+	// Track a timestamp for the successful heartbeat for better errors
+	atomic.StoreInt64(&a.lastHeartbeat, time.Now().Unix())
+
 	logger.Debug("Heartbeat sent at %s and received at %s", beat.SentAt, beat.ReceivedAt)
 	return nil
 }
@@ -227,9 +248,12 @@ func (a *AgentWorker) Ping() {
 
 	ping, _, err := a.APIClient.Pings.Get()
 	if err != nil {
+		// Get the last ping time to the nearest microsecond
+		lastPing := time.Unix(atomic.LoadInt64(&a.lastPing), 0)
+
 		// If a ping fails, we don't really care, because it'll
 		// ping again after the interval.
-		logger.Warn("Failed to ping: %s", err)
+		logger.Warn("Failed to ping: %s (Last successful was %v ago)", err, time.Now().Sub(lastPing))
 
 		// When the ping fails, we wan't to reset our disconnection
 		// timer. It wouldnt' be very nice if we just killed the agent
@@ -242,6 +266,9 @@ func (a *AgentWorker) Ping() {
 		}
 
 		return
+	} else {
+		// Track a timestamp for the successful ping for better errors
+		atomic.StoreInt64(&a.lastPing, time.Now().Unix())
 	}
 
 	// Should we switch endpoints?

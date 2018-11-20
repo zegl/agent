@@ -1,11 +1,11 @@
 package bootstrap
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -13,9 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/buildkite/agent/agent"
+	"github.com/buildkite/agent/agent/plugin"
 	"github.com/buildkite/agent/bootstrap/shell"
 	"github.com/buildkite/agent/env"
+	"github.com/buildkite/agent/process"
 	"github.com/buildkite/agent/retry"
 	"github.com/buildkite/shellwords"
 	"github.com/pkg/errors"
@@ -29,21 +30,21 @@ type Bootstrap struct {
 	// Config provides the bootstrap configuration
 	Config
 
+	// Phases to execute, defaults to all phases
+	Phases []string
+
 	// Shell is the shell environment for the bootstrap
 	shell *shell.Shell
 
 	// Plugins are checkout out in the PluginPhase
 	plugins []*pluginCheckout
 
-	// Tracks whether there is a checkout to upload in the teardown
-	hasCheckout bool
-
 	// Whether the checkout dir was created as part of checkout
 	createdCheckoutDir bool
 }
 
 // Start runs the bootstrap and returns the exit code
-func (b *Bootstrap) Start() int {
+func (b *Bootstrap) Start() (exitCode int) {
 	// Check if not nil to allow for tests to overwrite shell
 	if b.shell == nil {
 		var err error
@@ -61,48 +62,68 @@ func (b *Bootstrap) Start() int {
 	defer func() {
 		if err := b.tearDown(); err != nil {
 			b.shell.Errorf("Error tearing down bootstrap: %v", err)
+
+			// this gets passed back via the named return
+			exitCode = shell.GetExitCode(err)
 		}
 	}()
 
 	// Initialize the environment, a failure here will still call the tearDown
 	if err := b.setUp(); err != nil {
 		b.shell.Errorf("Error setting up bootstrap: %v", err)
-		return 1
+		return shell.GetExitCode(err)
 	}
 
-	// These are the "Phases of bootstrap execution". They are designed to be
-	// run independently at some later stage (think buildkite-agent bootstrap checkout)
-	var phases = []func() error{
-		b.PluginPhase,
-		b.CheckoutPhase,
-		b.CommandPhase,
+	var includePhase = func(phase string) bool {
+		if len(b.Phases) == 0 {
+			return true
+		}
+		for _, include := range b.Phases {
+			if include == phase {
+				return true
+			}
+		}
+		return false
 	}
 
-	var phaseError error
+	//  Execute the bootstrap phases in order
+	var phaseErr error
 
-	for _, phase := range phases {
-		if phaseError = phase(); phaseError != nil {
-			break
+	if includePhase(`plugin`) {
+		phaseErr = b.PluginPhase()
+	}
+
+	if phaseErr == nil && includePhase(`checkout`) {
+		phaseErr = b.CheckoutPhase()
+	} else {
+		checkoutDir, exists := b.shell.Env.Get(`BUILDKITE_BUILD_CHECKOUT_PATH`)
+		if exists {
+			_ = b.shell.Chdir(checkoutDir)
 		}
 	}
 
-	if err := b.uploadArtifacts(); err != nil {
-		b.shell.Errorf("%v", err)
-		return shell.GetExitCode(err)
+	if phaseErr == nil && includePhase(`command`) {
+		phaseErr = b.CommandPhase()
+
+		// Only upload artifacts as part of the command phase
+		if err := b.uploadArtifacts(); err != nil {
+			b.shell.Errorf("%v", err)
+			return shell.GetExitCode(err)
+		}
 	}
 
 	// Phase errors are where something of ours broke that merits a big red error
 	// this won't include command failures, as we view that as more in the user space
-	if phaseError != nil {
-		b.shell.Errorf("%v", phaseError)
-		return shell.GetExitCode(phaseError)
+	if phaseErr != nil {
+		b.shell.Errorf("%v", phaseErr)
+		return shell.GetExitCode(phaseErr)
 	}
 
 	// Use the exit code from the command phase
 	exitStatus, _ := b.shell.Env.Get(`BUILDKITE_COMMAND_EXIT_STATUS`)
-	exitStatusInt, _ := strconv.Atoi(exitStatus)
+	exitStatusCode, _ := strconv.Atoi(exitStatus)
 
-	return exitStatusInt
+	return exitStatusCode
 }
 
 // executeHook runs a hook script with the hookRunner
@@ -125,27 +146,41 @@ func (b *Bootstrap) executeHook(name string, hookPath string, extraEnviron *env.
 	}
 	defer script.Close()
 
-	if b.Debug {
-		b.shell.Commentf("A hook runner was written to \"%s\" with the following:", script.Path())
-		b.shell.Printf("%s", hookPath)
+	cleanHookPath := hookPath
+
+	// Show a relative path if we can
+	if strings.HasPrefix(hookPath, b.shell.Getwd()) {
+		var err error
+		if cleanHookPath, err = filepath.Rel(b.shell.Getwd(), hookPath); err != nil {
+			cleanHookPath = hookPath
+		}
 	}
 
-	b.shell.Commentf("Executing \"%s\"", script.Path())
+	// Show the hook runner in debug, but the thing being run otherwise 💅🏻
+	if b.Debug {
+		b.shell.Commentf("A hook runner was written to \"%s\" with the following:", script.Path())
+		b.shell.Promptf("%s", process.FormatCommand(script.Path(), nil))
+	} else {
+		b.shell.Promptf("%s", process.FormatCommand(cleanHookPath, []string{}))
+	}
 
 	// Run the wrapper script
 	if err := b.shell.RunScript(script.Path(), extraEnviron); err != nil {
-		b.shell.Env.Set("BUILDKITE_LAST_HOOK_EXIT_STATUS", fmt.Sprintf("%d", shell.GetExitCode(err)))
-		b.shell.Errorf("The %s hook exited with an error: %v", name, err)
+		exitCode := shell.GetExitCode(err)
+		b.shell.Env.Set("BUILDKITE_LAST_HOOK_EXIT_STATUS", fmt.Sprintf("%d", exitCode))
+
+		// Give a simpler error if it's just a shell exit error
+		if shell.IsExitError(err) {
+			return &shell.ExitError{
+				Code:    exitCode,
+				Message: fmt.Sprintf("The %s hook exited with status %d", name, exitCode),
+			}
+		}
 		return err
 	}
 
 	// Store the last hook exit code for subsequent steps
-	b.shell.Env.Set("BUILDKITE_LAST_HOOK_EXIT_STATUS",
-		fmt.Sprintf("%d", shell.GetExitCode(err)))
-
-	if err != nil {
-		return errors.Wrapf(err, "The %s hook exited with an error", name)
-	}
+	b.shell.Env.Set("BUILDKITE_LAST_HOOK_EXIT_STATUS", "0")
 
 	// Get changed environment
 	changes, err := script.Changes()
@@ -159,8 +194,7 @@ func (b *Bootstrap) executeHook(name string, hookPath string, extraEnviron *env.
 }
 
 func (b *Bootstrap) applyEnvironmentChanges(environ *env.Environment, dir string) {
-	if dir != "" {
-		b.shell.Commentf("Applying working directory change: %s", dir)
+	if dir != b.shell.Getwd() {
 		_ = b.shell.Chdir(dir)
 	}
 
@@ -250,12 +284,23 @@ func (b *Bootstrap) executeLocalHook(name string) error {
 	}
 
 	localHookPath, err := b.localHookPath(name)
-	noLocalHooks, _ := b.shell.Env.Get(`BUILDKITE_NO_LOCAL_HOOKS`)
-
-	// For high-security configs, we allow the disabling of local hooks. This is only exposed via env at this point
-	if noLocalHooks == "true" && err == nil {
-		return fmt.Errorf("Attempted to run %s, but BUILDKITE_NO_LOCAL_HOOKS is enabled", localHookPath)
+	if err != nil {
+		return nil
 	}
+
+	// For high-security configs, we allow the disabling of local hooks.
+	localHooksEnabled := b.Config.LocalHooksEnabled
+
+	// Allow hooks to disable local hooks by setting BUILDKITE_NO_LOCAL_HOOKS=true
+	noLocalHooks, _ := b.shell.Env.Get(`BUILDKITE_NO_LOCAL_HOOKS`)
+	if noLocalHooks == "true" || noLocalHooks == "1" {
+		localHooksEnabled = false
+	}
+
+	if !localHooksEnabled {
+		return fmt.Errorf("Refusing to run %s, local hooks are disabled", localHookPath)
+	}
+
 	return b.executeHook("local "+name, localHookPath, nil)
 }
 
@@ -320,12 +365,37 @@ func (b *Bootstrap) setUp() error {
 		b.shell.Env.Set("PATH", fmt.Sprintf("%s%s%s", b.BinPath, string(os.PathListSeparator), path))
 	}
 
-	b.shell.Env.Set("BUILDKITE_BUILD_CHECKOUT_PATH", filepath.Join(b.BuildPath, dirForAgentName(b.AgentName), b.OrganizationSlug, b.PipelineSlug))
+	// Set a BUILDKITE_BUILD_CHECKOUT_PATH unless one exists already. We do this here
+	// so that the environment will have a checkout path to work with
+	if _, exists := b.shell.Env.Get("BUILDKITE_BUILD_CHECKOUT_PATH"); !exists {
+		if b.BuildPath == "" {
+			return fmt.Errorf("Must set either a BUILDKITE_BUILD_PATH or a BUILDKITE_BUILD_CHECKOUT_PATH")
+		}
+		b.shell.Env.Set("BUILDKITE_BUILD_CHECKOUT_PATH",
+			filepath.Join(b.BuildPath, dirForAgentName(b.AgentName), b.OrganizationSlug, b.PipelineSlug))
+	}
+
+	// The job runner sets BUILDKITE_IGNORED_ENV with any keys that were ignored
+	// or overwritten. This shows a warning to the user so they don't get confused
+	// when their environment changes don't seem to do anything
+	if ignored, exists := b.shell.Env.Get("BUILDKITE_IGNORED_ENV"); exists {
+		b.shell.Headerf("Detected protected environment variables")
+		b.shell.Commentf("Your pipeline environment has protected environment variables set. " +
+			"These can only be set via hooks, plugins or the agent configuration.")
+
+		for _, env := range strings.Split(ignored, ",") {
+			b.shell.Warningf("Ignored %s", env)
+		}
+
+		b.shell.Printf("^^^ +++")
+	}
 
 	if b.Debug {
-		b.shell.Headerf("Build environment variables")
+		b.shell.Headerf("Buildkite environment variables")
 		for _, e := range b.shell.Env.ToSlice() {
-			if strings.HasPrefix(e, "BUILDKITE") || strings.HasPrefix(e, "CI") || strings.HasPrefix(e, "PATH") {
+			if strings.HasPrefix(e, "BUILDKITE_AGENT_ACCESS_TOKEN=") {
+				b.shell.Printf("BUILDKITE_AGENT_ACCESS_TOKEN=******************")
+			} else if strings.HasPrefix(e, "BUILDKITE") || strings.HasPrefix(e, "CI") || strings.HasPrefix(e, "PATH") {
 				b.shell.Printf("%s", strings.Replace(e, "\n", "\\n", -1))
 			}
 		}
@@ -382,14 +452,16 @@ func (b *Bootstrap) PluginPhase() error {
 
 	// Check if we can run plugins (disabled via --no-plugins)
 	if b.Plugins != "" && !b.Config.PluginsEnabled {
-		if !b.Config.CommandEval {
+		if !b.Config.LocalHooksEnabled {
+			return fmt.Errorf("Plugins have been disabled on this agent with `--no-local-hooks`")
+		} else if !b.Config.CommandEval {
 			return fmt.Errorf("Plugins have been disabled on this agent with `--no-command-eval`")
 		} else {
 			return fmt.Errorf("Plugins have been disabled on this agent with `--no-plugins`")
 		}
 	}
 
-	plugins, err := agent.CreatePluginsFromJSON(b.Plugins)
+	plugins, err := plugin.CreateFromJSON(b.Plugins)
 	if err != nil {
 		return errors.Wrap(err, "Failed to parse plugin definition")
 	}
@@ -400,9 +472,41 @@ func (b *Bootstrap) PluginPhase() error {
 		checkout, err := b.checkoutPlugin(p)
 		if err != nil {
 			return errors.Wrapf(err, "Failed to checkout plugin %s", p.Name())
-
+		}
+		if b.Config.PluginValidation {
+			if b.Debug {
+				b.shell.Commentf("Parsing plugin definition for %s from %s", p.Name(), checkout.CheckoutDir)
+			}
+			// parse the plugin definition from the plugin checkout dir
+			checkout.Definition, err = plugin.LoadDefinitionFromDir(checkout.CheckoutDir)
+			if err == plugin.ErrDefinitionNotFound {
+				b.shell.Warningf("Failed to find plugin definition for plugin %s", p.Name())
+			} else if err != nil {
+				return err
+			}
 		}
 		b.plugins = append(b.plugins, checkout)
+	}
+
+	if b.Config.PluginValidation {
+		for _, checkout := range b.plugins {
+			// This is nil if the definition failed to parse or is missing
+			if checkout.Definition == nil {
+				continue
+			}
+
+			val := &plugin.Validator{}
+			result := val.Validate(checkout.Definition, checkout.Plugin.Configuration)
+
+			if !result.Valid() {
+				b.shell.Headerf("Plugin validation failed for %q", checkout.Plugin.Name())
+				json, _ := json.Marshal(checkout.Plugin.Configuration)
+				b.shell.Commentf("Plugin configuration JSON is %s", json)
+				return result
+			} else {
+				b.shell.Commentf("Valid plugin configuration for %q", checkout.Plugin.Name())
+			}
+		}
 	}
 
 	// Now we can run plugin environment hooks too
@@ -436,12 +540,27 @@ func (b *Bootstrap) hasPluginHook(name string) bool {
 }
 
 // Checkout a given plugin to the plugins directory and return that directory
-func (b *Bootstrap) checkoutPlugin(p *agent.Plugin) (*pluginCheckout, error) {
+func (b *Bootstrap) checkoutPlugin(p *plugin.Plugin) (*pluginCheckout, error) {
 	// Get the identifer for the plugin
 	id, err := p.Identifier()
 	if err != nil {
 		return nil, err
 	}
+
+	// Ensure the plugin directory exists, otherwise we can't create the lock
+	err = os.MkdirAll(b.PluginsPath, 0777)
+	if err != nil {
+		return nil, err
+	}
+
+	// Try and lock this particular plugin while we check it out (we create
+	// the file outside of the plugin directory so git clone doesn't have
+	// a cry about the directory not being empty)
+	pluginCheckoutHook, err := b.shell.LockFile(filepath.Join(b.PluginsPath, id+".lock"), time.Minute*5)
+	if err != nil {
+		return nil, err
+	}
+	defer pluginCheckoutHook.Unlock()
 
 	// Create a path to the plugin
 	directory := filepath.Join(b.PluginsPath, id)
@@ -471,15 +590,6 @@ func (b *Bootstrap) checkoutPlugin(p *agent.Plugin) (*pluginCheckout, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// Try and lock this particular plugin while we check it out (we create
-	// the file outside of the plugin directory so git clone doesn't have
-	// a cry about the directory not being empty)
-	pluginCheckoutHook, err := b.shell.LockFile(filepath.Join(b.PluginsPath, id+".lock"), time.Minute*5)
-	if err != nil {
-		return nil, err
-	}
-	defer pluginCheckoutHook.Unlock()
 
 	// Once we've got the lock, we need to make sure another process didn't already
 	// checkout the plugin
@@ -578,12 +688,12 @@ func (b *Bootstrap) CheckoutPhase() error {
 		}
 	}
 
+	b.shell.Headerf("Preparing working directory")
+
 	// Make sure the build directory exists
 	if err := b.createCheckoutDir(); err != nil {
 		return err
 	}
-
-	b.shell.Headerf("Preparing build directory")
 
 	// There can only be one checkout hook, either plugin or global, in that order
 	switch {
@@ -600,6 +710,13 @@ func (b *Bootstrap) CheckoutPhase() error {
 			err := b.defaultCheckoutPhase()
 			if err != nil {
 				b.shell.Warningf("Checkout failed! %s (%s)", err, s)
+
+				// Checkout can fail because of corrupted files in the checkout
+				// which can leave the agent in a state where it keeps failing
+				// This removes the checkout dir, which means the next checkout
+				// will be a lot slower (clone vs fetch), but hopefully will
+				// allow the agent to self-heal
+				_ = b.removeCheckoutDir()
 			}
 			return err
 		}, &retry.Config{Maximum: 3, Interval: 2 * time.Second})
@@ -607,9 +724,6 @@ func (b *Bootstrap) CheckoutPhase() error {
 			return err
 		}
 	}
-
-	// After this point, artifacts will be uploaded on failure
-	b.hasCheckout = true
 
 	// Store the current value of BUILDKITE_BUILD_CHECKOUT_PATH, so we can detect if
 	// one of the post-checkout hooks changed it.
@@ -643,6 +757,10 @@ func (b *Bootstrap) CheckoutPhase() error {
 	return nil
 }
 
+func hasGitSubmodules(sh *shell.Shell) bool {
+	return fileExists(filepath.Join(sh.Getwd(), ".gitmodules"))
+}
+
 // defaultCheckoutPhase is called by the CheckoutPhase if no global or plugin checkout
 // hook exists. It performs the default checkout on the Repository provided in the config
 func (b *Bootstrap) defaultCheckoutPhase() error {
@@ -660,20 +778,22 @@ func (b *Bootstrap) defaultCheckoutPhase() error {
 	if fileExists(existingGitDir) {
 		// Update the the origin of the repository so we can gracefully handle repository renames
 		if err := b.shell.Run("git", "remote", "set-url", "origin", b.Repository); err != nil {
-			// Remove the checkout as often this is due to a corrupt git repo
-			_ = b.removeCheckoutDir()
 			return err
 		}
 	} else {
 		if err := gitClone(b.shell, b.GitCloneFlags, b.Repository, "."); err != nil {
-			// Remove the checkout as often this is due to files left in the dir
-			_ = b.removeCheckoutDir()
 			return err
 		}
 	}
 
 	// Git clean prior to checkout
-	if err := gitClean(b.shell, b.GitCleanFlags, b.GitSubmodules); err != nil {
+	if hasGitSubmodules(b.shell) {
+		if err := gitCleanSubmodules(b.shell, b.GitCleanFlags); err != nil {
+			return err
+		}
+	}
+
+	if err := gitClean(b.shell, b.GitCleanFlags); err != nil {
 		return err
 	}
 
@@ -694,7 +814,7 @@ func (b *Bootstrap) defaultCheckoutPhase() error {
 		// references the commit. We presume a commit sha is provided. See:
 		// https://help.github.com/articles/checking-out-pull-requests-locally/#modifying-an-inactive-pull-request-locally
 	} else if b.PullRequest != "false" && strings.Contains(b.PipelineProvider, "github") {
-		b.shell.Commentf("Fetch and checkout pull request head")
+		b.shell.Commentf("Fetch and checkout pull request head from GitHub")
 		refspec := fmt.Sprintf("refs/pull/%s/head", b.PullRequest)
 
 		if err := gitFetch(b.shell, "-v", "origin", refspec); err != nil {
@@ -724,7 +844,6 @@ func (b *Bootstrap) defaultCheckoutPhase() error {
 		// support fetching a specific commit so we fall back to fetching all heads
 		// and tags, hoping that the commit is included.
 	} else {
-		b.shell.Commentf("Fetch and checkout commit")
 		if err := gitFetch(b.shell, "-v", "origin", b.Commit); err != nil {
 			// By default `git fetch origin` will only fetch tags which are
 			// reachable from a fetches branch. git 1.9.0+ changed `--tags` to
@@ -740,7 +859,15 @@ func (b *Bootstrap) defaultCheckoutPhase() error {
 		}
 	}
 
-	if b.GitSubmodules {
+	var gitSubmodules bool
+	if !b.GitSubmodules && hasGitSubmodules(b.shell) {
+		b.shell.Warningf("This repository has submodules, but submodules are disabled at an agent level")
+	} else if b.GitSubmodules && hasGitSubmodules(b.shell) {
+		b.shell.Commentf("Git submodules detected")
+		gitSubmodules = true
+	}
+
+	if gitSubmodules {
 		// submodules might need their fingerprints verified too
 		if b.SSHKeyscan {
 			b.shell.Commentf("Checking to see if submodule urls need to be added to known_hosts")
@@ -772,9 +899,19 @@ func (b *Bootstrap) defaultCheckoutPhase() error {
 		}
 	}
 
-	// Git clean after checkout
-	if err := gitClean(b.shell, b.GitCleanFlags, b.GitSubmodules); err != nil {
+	// Git clean after checkout. We need to do this because submodules could have
+	// changed in between the last checkout and this one. A double clean is the only
+	// good solution to this problem that we've found
+	b.shell.Commentf("Cleaning again to catch any post-checkout changes")
+
+	if err := gitClean(b.shell, b.GitCleanFlags); err != nil {
 		return err
+	}
+
+	if gitSubmodules {
+		if err := gitCleanSubmodules(b.shell, b.GitCleanFlags); err != nil {
+			return err
+		}
 	}
 
 	if _, hasToken := b.shell.Env.Get("BUILDKITE_AGENT_ACCESS_TOKEN"); !hasToken {
@@ -787,7 +924,7 @@ func (b *Bootstrap) defaultCheckoutPhase() error {
 	// we'll check to see if someone else has done
 	// it first.
 	b.shell.Commentf("Checking to see if Git data needs to be sent to Buildkite")
-	if _, err := b.shell.RunAndCapture("buildkite-agent", "meta-data", "exists", "buildkite:git:commit"); err != nil {
+	if err := b.shell.Run("buildkite-agent", "meta-data", "exists", "buildkite:git:commit"); err != nil {
 		b.shell.Commentf("Sending Git commit information back to Buildkite")
 
 		gitCommitOutput, err := b.shell.RunAndCapture("git", "--no-pager", "show", "HEAD", "-s", "--format=fuller", "--no-color")
@@ -795,15 +932,7 @@ func (b *Bootstrap) defaultCheckoutPhase() error {
 			return err
 		}
 
-		gitBranchOutput, err := b.shell.RunAndCapture("git", "--no-pager", "branch", "--contains", "HEAD", "--no-color")
-		if err != nil {
-			return err
-		}
-
 		if err = b.shell.Run("buildkite-agent", "meta-data", "set", "buildkite:git:commit", gitCommitOutput); err != nil {
-			return err
-		}
-		if err = b.shell.Run("buildkite-agent", "meta-data", "set", "buildkite:git:branch", gitBranchOutput); err != nil {
 			return err
 		}
 	}
@@ -842,7 +971,9 @@ func (b *Bootstrap) CommandPhase() error {
 	// If the command returned an exit that wasn't a `exec.ExitError`
 	// (which is returned when the command is actually run, but fails),
 	// then we'll show it in the log.
-	if _, ok := commandExitError.(*exec.ExitError); commandExitError != nil && !ok {
+	if shell.IsExitError(commandExitError) {
+		b.shell.Errorf("The command exited with status %d", shell.GetExitCode(commandExitError))
+	} else if commandExitError != nil {
 		b.shell.Errorf(commandExitError.Error())
 	}
 
@@ -960,7 +1091,13 @@ func (b *Bootstrap) defaultCommandPhase() error {
 	cmd = append(cmd, shell...)
 	cmd = append(cmd, cmdToExec)
 
-	return b.shell.Run(cmd[0], cmd[1:]...)
+	if b.Debug {
+		b.shell.Promptf("%s", process.FormatCommand(cmd[0], cmd[1:]))
+	} else {
+		b.shell.Promptf("%s", cmdToExec)
+	}
+
+	return b.shell.RunWithoutPrompt(cmd[0], cmd[1:]...)
 }
 
 func (b *Bootstrap) writeBatchScript(cmd string) (string, error) {
@@ -990,13 +1127,7 @@ func (b *Bootstrap) writeBatchScript(cmd string) (string, error) {
 }
 
 func (b *Bootstrap) uploadArtifacts() error {
-	if !b.hasCheckout {
-		b.shell.Commentf("Skipping artifact upload, no checkout")
-		return nil
-	}
-
 	if b.AutomaticArtifactUploadPaths == "" {
-		b.shell.Commentf("Skipping artifact upload, no artifact upload path set")
 		return nil
 	}
 
@@ -1043,8 +1174,24 @@ func (b *Bootstrap) uploadArtifacts() error {
 	return nil
 }
 
+// Check for ignored env variables from the job runner. Some
+// env (e.g BUILDKITE_BUILD_PATH) can only be set from config or by hooks.
+// If these env are set at a pipeline level, we rewrite them to BUILDKITE_X_BUILD_PATH
+// and warn on them here so that users know what is going on
+func (b *Bootstrap) ignoredEnv() []string {
+	var ignored []string
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, `BUILDKITE_X_`) {
+			ignored = append(ignored, fmt.Sprintf("BUILDKITE_%s",
+				strings.TrimPrefix(env, `BUILDKITE_X_`)))
+		}
+	}
+	return ignored
+}
+
 type pluginCheckout struct {
-	*agent.Plugin
+	*plugin.Plugin
+	*plugin.Definition
 	CheckoutDir string
 	HooksDir    string
 }

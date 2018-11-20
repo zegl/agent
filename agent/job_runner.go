@@ -1,14 +1,17 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/buildkite/agent/api"
+	"github.com/buildkite/agent/experiments"
 	"github.com/buildkite/agent/logger"
 	"github.com/buildkite/agent/process"
 	"github.com/buildkite/agent/retry"
@@ -22,6 +25,9 @@ type JobRunner struct {
 	// The APIClient that will be used when updating the job
 	APIClient *api.Client
 
+	// The APIProxy that will be exposed to the job bootstrap
+	APIProxy *APIProxy
+
 	// The endpoint that should be used when communicating with the API
 	Endpoint string
 
@@ -30,6 +36,10 @@ type JobRunner struct {
 
 	// The configuration of the agent from the CLI
 	AgentConfiguration *AgentConfiguration
+
+	// Go context for goroutine supervision
+	context       context.Context
+	contextCancel context.CancelFunc
 
 	// The interal process of the job
 	process *process.Process
@@ -57,15 +67,27 @@ type JobRunner struct {
 func (r JobRunner) Create() (runner *JobRunner, err error) {
 	runner = &r
 
+	runner.context, runner.contextCancel = context.WithCancel(context.Background())
+
 	// Our own APIClient using the endpoint and the agents access token
 	runner.APIClient = APIClient{Endpoint: r.Endpoint, Token: r.Agent.AccessToken}.Create()
 
-	// // Create our header times struct
+	// A proxy for the agent API that is expose to the bootstrap
+	runner.APIProxy = NewAPIProxy(r.Endpoint, r.Agent.AccessToken)
+
+	// Create our header times struct
 	runner.headerTimesStreamer = &HeaderTimesStreamer{UploadCallback: r.onUploadHeaderTime}
 
 	// The log streamer that will take the output chunks, and send them to
 	// the Buildkite Agent API
 	runner.logStreamer = LogStreamer{MaxChunkSizeBytes: r.Job.ChunksMaxSizeBytes, Callback: r.onUploadChunk}.New()
+
+	// Start a proxy to give to the job for api operations
+	if experiments.IsEnabled("agent-socket") {
+		if err := r.APIProxy.Listen(); err != nil {
+			return nil, err
+		}
+	}
 
 	// Prepare a file to recieve the given job environment
 	if file, err := ioutil.TempFile("", fmt.Sprintf("job-env-%s", runner.Job.ID)); err != nil {
@@ -148,11 +170,9 @@ func (r *JobRunner) Run() error {
 		logger.Warn("%d chunks failed to upload for this job", r.logStreamer.ChunksFailedCount)
 	}
 
-	// Finish the build in the Buildkite Agent API
-	r.finishJob(finishedAt, r.process.ExitStatus, int(r.logStreamer.ChunksFailedCount))
-
 	// Wait for the routines that we spun up to finish
 	logger.Debug("[JobRunner] Waiting for all other routines to finish")
+	r.contextCancel()
 	r.routineWaitGroup.Wait()
 
 	// Remove the env file, if any
@@ -162,6 +182,19 @@ func (r *JobRunner) Run() error {
 		}
 		logger.Debug("[JobRunner] Deleted env file: %s", r.envFile.Name())
 	}
+
+	// Destroy the proxy
+	if experiments.IsEnabled("agent-socket") {
+		if err := r.APIProxy.Close(); err != nil {
+			logger.Warn("[JobRunner] Failed to close API proxy: %v", err)
+		}
+	}
+
+	// Finish the build in the Buildkite Agent API
+	//
+	// Once we tell the API we're finished it might assign us new work, so make
+	// sure everything else is done first.
+	r.finishJob(finishedAt, r.process.ExitStatus, int(r.logStreamer.ChunksFailedCount))
 
 	logger.Info("Finished job %s", r.Job.ID)
 
@@ -212,9 +245,52 @@ func (r *JobRunner) createEnvironment() ([]string, error) {
 		env["BUILDKITE_ENV_FILE"] = r.envFile.Name()
 	}
 
+	// Certain env can only be set by agent configuration.
+	// We show the user a warning in the bootstrap if they use any of these at a job level.
+
+	var protectedEnv = []string{
+		`BUILDKITE_AGENT_ENDPOINT`,
+		`BUILDKITE_AGENT_ACCESS_TOKEN`,
+		`BUILDKITE_AGENT_DEBUG`,
+		`BUILDKITE_AGENT_PID`,
+		`BUILDKITE_BIN_PATH`,
+		`BUILDKITE_CONFIG_PATH`,
+		`BUILDKITE_BUILD_PATH`,
+		`BUILDKITE_HOOKS_PATH`,
+		`BUILDKITE_PLUGINS_PATH`,
+		`BUILDKITE_SSH_KEYSCAN`,
+		`BUILDKITE_GIT_SUBMODULES`,
+		`BUILDKITE_COMMAND_EVAL`,
+		`BUILDKITE_PLUGINS_ENABLED`,
+		`BUILDKITE_LOCAL_HOOKS_ENABLED`,
+		`BUILDKITE_GIT_CLONE_FLAGS`,
+		`BUILDKITE_GIT_CLEAN_FLAGS`,
+		`BUILDKITE_SHELL`,
+	}
+
+	var ignoredEnv []string
+
+	// Check if the user has defined any protected env
+	for _, p := range protectedEnv {
+		if _, exists := r.Job.Env[p]; exists {
+			ignoredEnv = append(ignoredEnv, p)
+		}
+	}
+
+	// Set BUILDKITE_IGNORED_ENV so the bootstrap can show warnings
+	if len(ignoredEnv) > 0 {
+		env["BUILDKITE_IGNORED_ENV"] = strings.Join(ignoredEnv, ",")
+	}
+
+	if experiments.IsEnabled("agent-socket") {
+		env["BUILDKITE_AGENT_ENDPOINT"] = r.APIProxy.Endpoint()
+		env["BUILDKITE_AGENT_ACCESS_TOKEN"] = r.APIProxy.AccessToken()
+	} else {
+		env["BUILDKITE_AGENT_ENDPOINT"] = r.Endpoint
+		env["BUILDKITE_AGENT_ACCESS_TOKEN"] = r.Agent.AccessToken
+	}
+
 	// Add agent environment variables
-	env["BUILDKITE_AGENT_ENDPOINT"] = r.Endpoint
-	env["BUILDKITE_AGENT_ACCESS_TOKEN"] = r.Agent.AccessToken
 	env["BUILDKITE_AGENT_DEBUG"] = fmt.Sprintf("%t", logger.GetLevel() == logger.DEBUG)
 	env["BUILDKITE_AGENT_PID"] = fmt.Sprintf("%d", os.Getpid())
 
@@ -232,9 +308,23 @@ func (r *JobRunner) createEnvironment() ([]string, error) {
 	env["BUILDKITE_GIT_SUBMODULES"] = fmt.Sprintf("%t", r.AgentConfiguration.GitSubmodules)
 	env["BUILDKITE_COMMAND_EVAL"] = fmt.Sprintf("%t", r.AgentConfiguration.CommandEval)
 	env["BUILDKITE_PLUGINS_ENABLED"] = fmt.Sprintf("%t", r.AgentConfiguration.PluginsEnabled)
+	env["BUILDKITE_LOCAL_HOOKS_ENABLED"] = fmt.Sprintf("%t", r.AgentConfiguration.LocalHooksEnabled)
 	env["BUILDKITE_GIT_CLONE_FLAGS"] = r.AgentConfiguration.GitCloneFlags
 	env["BUILDKITE_GIT_CLEAN_FLAGS"] = r.AgentConfiguration.GitCleanFlags
 	env["BUILDKITE_SHELL"] = r.AgentConfiguration.Shell
+
+	enablePluginValidation := r.AgentConfiguration.PluginValidation
+
+	// Allow BUILDKITE_PLUGIN_VALIDATION to be enabled from env for easier
+	// per-pipeline testing
+	if pluginValidation, ok := env["BUILDKITE_PLUGIN_VALIDATION"]; ok {
+		switch pluginValidation {
+		case "true", "1", "on":
+			enablePluginValidation = true
+		}
+	}
+
+	env["BUILDKITE_PLUGIN_VALIDATION"] = fmt.Sprintf("%t", enablePluginValidation)
 
 	// Convert the env map into a slice (which is what the script gear
 	// needs)
@@ -313,9 +403,14 @@ func (r *JobRunner) onProcessStartCallback() {
 			// for processing
 			r.logStreamer.Process(r.process.Output())
 
-			// Check the output in another second
-			time.Sleep(1 * time.Second)
+			// Sleep for a bit, or until the job is finished
+			select {
+			case <-time.After(1 * time.Second):
+			case <-r.context.Done():
+			}
 		}
+
+		// The final output after the process has finished is processed in Run()
 
 		// Mark this routine as done in the wait group
 		r.routineWaitGroup.Done()
@@ -338,8 +433,11 @@ func (r *JobRunner) onProcessStartCallback() {
 				r.Kill()
 			}
 
-			// Check for cancellations
-			time.Sleep(time.Duration(r.Agent.JobStatusInterval) * time.Second)
+			// Sleep for a bit, or until the job is finished
+			select {
+			case <-time.After(time.Duration(r.Agent.JobStatusInterval) * time.Second):
+			case <-r.context.Done():
+			}
 		}
 
 		// Mark this routine as done in the wait group

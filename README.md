@@ -1,12 +1,12 @@
 # Buildkite Agent ![Build status](https://badge.buildkite.com/08e4e12a0a1e478f0994eb1e8d51822c5c74d395.svg?branch=master)
 
-_Note: This is the 3.0 development branch of the buildkite-agent, and may not contain files or code in the current stable release. To see code or submit PRs for stable agent versions, please use the corresponding maintenance branch: [2.6.x](https://github.com/buildkite/agent/tree/2-6-stable)_.
+_Note: This is the development branch of the buildkite-agent, and may not contain files or code in the current stable release._
 
 The buildkite-agent is a small, reliable, and cross-platform build runner that makes it easy to run automated builds on your own infrastructure. It’s main responsibilities are polling [buildkite.com](https://buildkite.com/) for work, running build jobs, reporting back the status code and output log of the job, and uploading the job's artifacts.
 
 Full documentation is available at [buildkite.com/docs/agent](https://buildkite.com/docs/agent)
 
-```bash
+```
 $ buildkite-agent --help
 Usage:
 
@@ -40,65 +40,38 @@ buildkite-agent start --token
 
 These instructions assume you are running a recent macOS, but could easily be adapted to Linux and Windows.
 
-### With Docker
-
 ```bash
-docker-compose run agent bash
-root@d854f845511a:/go/src/github.com/buildkite/agent# go run main.go start --token xxx --debug
-```
-
-### Without Docker
-
-```bash
-# Make sure you have go installed.
+# Make sure you have go 1.11+ installed.
 brew install go
 
-# Setup your GOPATH
-export GOPATH="$HOME/go"
-export PATH="$HOME/go/bin:$PATH"
+# Download the code somewhere, no GOPATH required
+git clone https://github.com/buildkite/agent.git
+cd agent
 
-# Checkout the code
-go get github.com/buildkite/agent
-cd "$HOME/go/src/github.com/buildkite/agent"
-```
-
-To test the commands locally:
-
-```bash
+# Start the agent
 go run main.go start --debug --token "abc123"
-```
-
-### Windows via Vagrant
-
-This requires either Virtualbox (free) or VMWare Fusion + Vagrant VMWare Fusion plugin (paid).
-
-It assumes that you have Docker for Mac or similar installed. The following commands are run on your local machine. Expect things to take a long time, the vagrant box is 10GB and the docker base image is 3.4GB.
-
-```bash
-vagrant up
-eval $(docker-machine env windows-2016)
-docker-compose -f docker-compose.windows.yml run agent cmd
-C:\gopath\src\github.com\buildkite\agent> go run main.go start --token xxx --debug
 ```
 
 ### Dependency management
 
-We're using [govendor](https://github.com/kardianos/govendor) to manage our Go dependencies. Install it with:
+We're go 1.11+ and [Go Modules](https://github.com/golang/go/wiki/Modules) to manage our Go dependencies. We are keeping the dependencies vendored to remain backwards compatible with older go versions.
+
+If you are using go 1.11 and have the agent in your `GOPATH`, you will need to enable modules via the environment variable:
 
 ```bash
-go get github.com/kardianos/govendor
+export GO111MODULE=on
 ```
 
-If you introduce a new package, just add the import to your source file and run:
+If you introduce a new package:
 
 ```bash
-govendor fetch +missing
+go get github.com/my/new/package
 ```
 
-Or explicitly fetch it with a version using:
+Then you can write that package to the `vendor/` with:
 
 ```bash
-govendor fetch github.com/buildkite/go-buildkite@v2.0.0
+go mod vendor
 ```
 
 ## Contributing
@@ -108,6 +81,10 @@ govendor fetch github.com/buildkite/go-buildkite@v2.0.0
 1. Commit your changes (`git commit -am 'Add some feature'`)
 1. Push to the branch (`git push origin my-new-feature`)
 1. Create new Pull Request
+
+## Contributors
+
+Many thanks to our fine contributors! @adill, @airhorns, @alexjurkiewicz, @bendrucker, @bradfeehan, @byroot, @cab, @caiofbpa, @colinrymer, @cysp, @daveoflynn, @daveoxley, @daveslutzkin, @davidk-zenefits, @DazWorrall, @dch, @deoxxa, @dgoodlad, @donpinkster, @essen, @grosskur, @jgavris, @joelmoss, @jules2689, @julianwa, @kouky, @marius92mc, @mirdhyn, @mousavian, @nikyoudale, @pda, @rprieto, @samritchie, @silarsis, @skevy, @stefanmb, @tekacs, @theojulienne, @tommeier, @underscorediscovery, and @wolfeidau.
 
 ## Copyright
 

@@ -17,12 +17,17 @@ import (
 
 	"github.com/buildkite/agent/env"
 	"github.com/buildkite/agent/process"
+	"github.com/buildkite/shellwords"
 	"github.com/nightlyone/lockfile"
 	"github.com/pkg/errors"
 )
 
 var (
 	lockRetryDuration = time.Second
+)
+
+const (
+	termType = `xterm-256color`
 )
 
 // Shell represents a virtual shell, handles logging, executing commands and
@@ -90,7 +95,7 @@ func (s *Shell) Chdir(path string) error {
 		path = filepath.Join(s.wd, path)
 	}
 
-	s.Commentf("Changing working directory to \"%s\"", path)
+	s.Promptf("cd %s", shellwords.Quote(path))
 
 	if _, err := os.Stat(path); err != nil {
 		return fmt.Errorf("Failed to change working: directory does not exist")
@@ -163,10 +168,17 @@ func (s *Shell) LockFile(path string, timeout time.Duration) (LockFile, error) {
 	return &lock, err
 }
 
-// Run runs a command, write stdout and stderr to the logger and return an error if it fails
+// Run runs a command, write stdout and stderr to the logger and return an error
+// if it fails
 func (s *Shell) Run(command string, arg ...string) error {
 	s.Promptf("%s", process.FormatCommand(command, arg))
 
+	return s.RunWithoutPrompt(command, arg...)
+}
+
+// RunWithoutPrompt runs a command, write stdout and stderr to the logger and
+// return an error if it fails. Notably it doesn't show a prompt.
+func (s *Shell) RunWithoutPrompt(command string, arg ...string) error {
 	cmd, err := s.buildCommand(command, arg...)
 	if err != nil {
 		s.Errorf("Error building command: %v", err)
@@ -243,8 +255,6 @@ func (s *Shell) RunScript(path string, extra *env.Environment) error {
 		args = []string{}
 	}
 
-	s.Promptf("%s", process.FormatCommand(command, args))
-
 	cmd, err := s.buildCommand(command, args...)
 	if err != nil {
 		s.Errorf("Error building command: %v", err)
@@ -274,6 +284,11 @@ func (s *Shell) buildCommand(name string, arg ...string) (*exec.Cmd, error) {
 	cmd := exec.Command(absPath, arg...)
 	cmd.Env = s.Env.ToSlice()
 	cmd.Dir = s.wd
+
+	// Add env that commands expect a shell to set
+	cmd.Env = append(cmd.Env,
+		`PWD=`+s.wd,
+	)
 
 	return cmd, nil
 }
@@ -312,7 +327,7 @@ func (s *Shell) executeCommand(cmd *exec.Cmd, w io.Writer, flags executeFlags) e
 	if s.Debug {
 		t := time.Now()
 		defer func() {
-			s.Commentf("Command completed in %v", time.Now().Sub(t))
+			s.Commentf("↳ Command completed in %v", time.Now().Sub(t))
 		}()
 	}
 
@@ -330,6 +345,9 @@ func (s *Shell) executeCommand(cmd *exec.Cmd, w io.Writer, flags executeFlags) e
 			// that it closed successfully.
 			// See https://github.com/buildkite/agent/pull/34#issuecomment-46080419
 		}
+
+		// Commands like tput expect a TERM value for a PTY
+		cmd.Env = append(cmd.Env, `TERM=`+termType)
 	} else {
 		cmd.Stdout = nil
 		cmd.Stderr = nil
@@ -357,10 +375,6 @@ func (s *Shell) executeCommand(cmd *exec.Cmd, w io.Writer, flags executeFlags) e
 	}
 
 	if err := cmd.Wait(); err != nil {
-		if s.Debug {
-			s.Printf("Exited with error: %v", err)
-		}
-
 		return errors.Wrapf(err, "Error running `%s`", cmdStr)
 	}
 
@@ -374,6 +388,9 @@ func GetExitCode(err error) int {
 		return 0
 	}
 	switch cause := errors.Cause(err).(type) {
+	case *ExitError:
+		return cause.Code
+
 	case *exec.ExitError:
 		// The program has exited with an exit code != 0
 		// There is no platform independent way to retrieve
@@ -383,4 +400,25 @@ func GetExitCode(err error) int {
 		}
 	}
 	return 1
+}
+
+func IsExitError(err error) bool {
+	switch errors.Cause(err).(type) {
+	case *ExitError:
+		return true
+	case *exec.ExitError:
+		return true
+	}
+	return false
+}
+
+// ExitError is an error that carries a shell exit code
+type ExitError struct {
+	Code    int
+	Message string
+}
+
+// Error returns the string message and fulfils the error interface
+func (ee *ExitError) Error() string {
+	return ee.Message
 }

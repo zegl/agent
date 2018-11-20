@@ -45,15 +45,16 @@ type AgentStartConfig struct {
 	DisconnectAfterJob        bool     `cli:"disconnect-after-job"`
 	DisconnectAfterJobTimeout int      `cli:"disconnect-after-job-timeout"`
 	CancelGracePeriod         int      `cli:"cancel-grace-period"`
-	BootstrapScript           string   `cli:"bootstrap-script" normalize:"filepath"`
+	BootstrapScript           string   `cli:"bootstrap-script" normalize:"commandpath"`
 	BuildPath                 string   `cli:"build-path" normalize:"filepath" validate:"required"`
 	HooksPath                 string   `cli:"hooks-path" normalize:"filepath"`
 	PluginsPath               string   `cli:"plugins-path" normalize:"filepath"`
 	Shell                     string   `cli:"shell"`
-	Tags                      []string `cli:"tags"`
+	Tags                      []string `cli:"tags" normalize:"list"`
 	TagsFromEC2               bool     `cli:"tags-from-ec2"`
 	TagsFromEC2Tags           bool     `cli:"tags-from-ec2-tags"`
 	TagsFromGCP               bool     `cli:"tags-from-gcp"`
+	TagsFromHost              bool     `cli:"tags-from-host"`
 	WaitForEC2TagsTimeout     string   `cli:"wait-for-ec2-tags-timeout"`
 	GitCloneFlags             string   `cli:"git-clone-flags"`
 	GitCleanFlags             string   `cli:"git-clean-flags"`
@@ -61,13 +62,16 @@ type AgentStartConfig struct {
 	NoColor                   bool     `cli:"no-color"`
 	NoSSHKeyscan              bool     `cli:"no-ssh-keyscan"`
 	NoCommandEval             bool     `cli:"no-command-eval"`
+	NoLocalHooks              bool     `cli:"no-local-hooks"`
 	NoPlugins                 bool     `cli:"no-plugins"`
+	NoPluginValidation        bool     `cli:"no-plugin-validation"`
 	NoPTY                     bool     `cli:"no-pty"`
+	NoHTTP2                   bool     `cli:"no-http2"`
 	TimestampLines            bool     `cli:"timestamp-lines"`
 	Endpoint                  string   `cli:"endpoint" validate:"required"`
 	Debug                     bool     `cli:"debug"`
 	DebugHTTP                 bool     `cli:"debug-http"`
-	Experiments               []string `cli:"experiment"`
+	Experiments               []string `cli:"experiment" normalize:"list"`
 
 	/* Deprecated */
 	NoSSHFingerprintVerification bool     `cli:"no-automatic-ssh-fingerprint-verification" deprecated-and-renamed-to:"NoSSHKeyscan"`
@@ -93,6 +97,7 @@ func DefaultConfigFilePaths() (paths []string) {
 	// Toggle beetwen windows an *nix paths
 	if runtime.GOOS == "windows" {
 		paths = []string{
+			"C:\\buildkite-agent\\buildkite-agent.cfg",
 			"$USERPROFILE\\AppData\\Local\\BuildkiteAgent\\buildkite-agent.cfg",
 		}
 	} else {
@@ -171,6 +176,11 @@ var AgentStartCommand = cli.Command{
 			Value:  &cli.StringSlice{},
 			Usage:  "A comma-separated list of tags for the agent (e.g. \"linux\" or \"mac,xcode=8\")",
 			EnvVar: "BUILDKITE_AGENT_TAGS",
+		},
+		cli.BoolFlag{
+			Name:   "tags-from-host",
+			Usage:  "Include tags from the host (hostname, machine-id, os)",
+			EnvVar: "BUILDKITE_AGENT_TAGS_FROM_HOST",
 		},
 		cli.BoolFlag{
 			Name:   "tags-from-ec2",
@@ -254,10 +264,25 @@ var AgentStartCommand = cli.Command{
 			Usage:  "Don't allow this agent to load plugins",
 			EnvVar: "BUILDKITE_NO_PLUGINS",
 		},
+		cli.BoolTFlag{
+			Name:   "no-plugin-validation",
+			Usage:  "Don't validate plugin configuration and requirements",
+			EnvVar: "BUILDKITE_NO_PLUGIN_VALIDATION",
+		},
+		cli.BoolFlag{
+			Name:   "no-local-hooks",
+			Usage:  "Don't allow local hooks to be run from checked out repositories",
+			EnvVar: "BUILDKITE_NO_LOCAL_HOOKS",
+		},
 		cli.BoolFlag{
 			Name:   "no-git-submodules",
 			Usage:  "Don't automatically checkout git submodules",
 			EnvVar: "BUILDKITE_NO_GIT_SUBMODULES,BUILDKITE_DISABLE_GIT_SUBMODULES",
+		},
+		cli.BoolFlag{
+			Name:   "no-http2",
+			Usage:  "Disable HTTP2 when communicating with the Agent API.",
+			EnvVar: "BUILDKITE_NO_HTTP2",
 		},
 		ExperimentsFlag,
 		EndpointFlag,
@@ -322,8 +347,24 @@ var AgentStartCommand = cli.Command{
 			cfg.BootstrapScript = fmt.Sprintf("%s bootstrap", shellwords.Quote(os.Args[0]))
 		}
 
-		// Turning off command eval will also turn off plugins.
-		if cfg.NoCommandEval {
+		// Show a warning if plugins are enabled by no-command-eval or no-local-hooks is set
+		if c.IsSet("no-plugins") && cfg.NoPlugins == false {
+			msg := `Plugins have been specifically enabled, despite %s being enabled. ` +
+				`Plugins can execute arbitrary hooks and commands, make sure you are ` +
+				`whitelisting your plugins in ` +
+				`your environment hook.`
+
+			switch {
+			case cfg.NoCommandEval:
+				logger.Warn(msg, `no-command-eval`)
+			case cfg.NoLocalHooks:
+				logger.Warn(msg, `no-local-hooks`)
+			}
+		}
+
+		// Turning off command eval or local hooks will also turn off plugins unless
+		// `--no-plugins=false` is provided specifically
+		if (cfg.NoCommandEval || cfg.NoLocalHooks) && !c.IsSet("no-plugins") {
 			cfg.NoPlugins = true
 		}
 
@@ -355,8 +396,10 @@ var AgentStartCommand = cli.Command{
 			TagsFromEC2:           cfg.TagsFromEC2,
 			TagsFromEC2Tags:       cfg.TagsFromEC2Tags,
 			TagsFromGCP:           cfg.TagsFromGCP,
+			TagsFromHost:          cfg.TagsFromHost,
 			WaitForEC2TagsTimeout: ec2TagTimeout,
 			Endpoint:              cfg.Endpoint,
+			DisableHTTP2:          cfg.NoHTTP2,
 			AgentConfiguration: &agent.AgentConfiguration{
 				BootstrapScript:           cfg.BootstrapScript,
 				BuildPath:                 cfg.BuildPath,
@@ -368,6 +411,8 @@ var AgentStartCommand = cli.Command{
 				SSHKeyscan:                !cfg.NoSSHKeyscan,
 				CommandEval:               !cfg.NoCommandEval,
 				PluginsEnabled:            !cfg.NoPlugins,
+				PluginValidation:          !cfg.NoPluginValidation,
+				LocalHooksEnabled:         !cfg.NoLocalHooks,
 				RunInPty:                  !cfg.NoPTY,
 				TimestampLines:            cfg.TimestampLines,
 				DisconnectAfterJob:        cfg.DisconnectAfterJob,

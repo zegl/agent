@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/buildkite/agent/env"
+	"github.com/buildkite/agent/yamltojson"
 	"github.com/buildkite/interpolate"
 
 	// This is a fork of gopkg.in/yaml.v2 that fixes anchors with MapSlice
@@ -15,12 +16,13 @@ import (
 )
 
 type PipelineParser struct {
-	Env      *env.Environment
-	Filename string
-	Pipeline []byte
+	Env             *env.Environment
+	Filename        string
+	Pipeline        []byte
+	NoInterpolation bool
 }
 
-func (p PipelineParser) Parse() (interface{}, error) {
+func (p PipelineParser) Parse() (*PipelineParserResult, error) {
 	if p.Env == nil {
 		p.Env = env.FromSlice(os.Environ())
 	}
@@ -32,54 +34,34 @@ func (p PipelineParser) Parse() (interface{}, error) {
 		errPrefix = fmt.Sprintf("Failed to parse %s", p.Filename)
 	}
 
-	var pipeline interface{}
-	var pipelineAsSlice []interface{}
+	var pipelineAsSlice []topLevelStep
+	var pipeline yaml.MapSlice
 
-	// Historically we support uploading just steps, so we parse it as either a
-	// slice, or if it's a map we need to do environment block processing
-	if err := yaml.Unmarshal([]byte(p.Pipeline), &pipelineAsSlice); err == nil {
-		pipeline = pipelineAsSlice
-	} else {
-		pipelineAsMap, err := p.parseWithEnv()
-		if err != nil {
-			return nil, fmt.Errorf("%s: %v", errPrefix, formatYAMLError(err))
+	// We support top-level arrays of steps, so try that first
+	if err := yaml.Unmarshal(p.Pipeline, &pipelineAsSlice); err == nil {
+		var steps []interface{}
+
+		// Unwrap our custom topLevelStep types for marshaling later
+		for _, step := range pipelineAsSlice {
+			if step.MapSlice != nil {
+				steps = append(steps, step.MapSlice)
+			} else {
+				steps = append(steps, step.Body)
+			}
 		}
-		pipeline = pipelineAsMap
-	}
 
-	// Recursively go through the entire pipeline and perform environment
-	// variable interpolation on strings
-	interpolated, err := p.interpolate(pipeline)
-	if err != nil {
-		return nil, err
-	}
-
-	// Now we roundtrip this back into YAML bytes and back into a generic interface{}
-	// that works with all upstream code (which likes working with JSON). Specifically we
-	// need to convert the map[interface{}]interface{}'s that YAML likes into JSON compatible
-	// map[string]interface{}
-	b, err := yaml.Marshal(interpolated)
-	if err != nil {
-		return nil, err
-	}
-
-	var result interface{}
-	if err := unmarshalAsStringMap(b, &result); err != nil {
+		pipeline = yaml.MapSlice{
+			{Key: "steps", Value: steps},
+		}
+	} else if err := yaml.Unmarshal(p.Pipeline, &pipeline); err != nil {
 		return nil, fmt.Errorf("%s: %v", errPrefix, formatYAMLError(err))
 	}
 
-	return result, nil
-}
-
-func (p PipelineParser) parseWithEnv() (interface{}, error) {
-	var pipeline yaml.MapSlice
-
-	// Initially we unmarshal this into a yaml.MapSlice so that we preserve the order of maps
-	if err := yaml.Unmarshal([]byte(p.Pipeline), &pipeline); err != nil {
-		return nil, err
+	if p.NoInterpolation {
+		return &PipelineParserResult{pipeline: pipeline}, nil
 	}
 
-	// Preprocess any env tat are defined in the top level block and place them into env for
+	// Preprocess any env that are defined in the top level block and place them into env for
 	// later interpolation into env blocks
 	if item, ok := mapSliceItem("env", pipeline); ok {
 		if envMap, ok := item.Value.(yaml.MapSlice); ok {
@@ -91,7 +73,14 @@ func (p PipelineParser) parseWithEnv() (interface{}, error) {
 		}
 	}
 
-	return pipeline, nil
+	// Recursively go through the entire pipeline and perform environment
+	// variable interpolation on strings
+	interpolated, err := p.interpolate(pipeline)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PipelineParserResult{pipeline: interpolated.(yaml.MapSlice)}, nil
 }
 
 func mapSliceItem(key string, s yaml.MapSlice) (yaml.MapItem, bool) {
@@ -257,45 +246,27 @@ func (p PipelineParser) interpolateRecursive(copy, original reflect.Value) error
 	return nil
 }
 
-// Unmarshal YAML to map[string]interface{} instead of map[interface{}]interface{}, such that
-// we can Marshal cleanly into JSON
-// Via https://github.com/go-yaml/yaml/issues/139#issuecomment-220072190
-func unmarshalAsStringMap(in []byte, out interface{}) error {
-	var res interface{}
-
-	if err := yaml.Unmarshal(in, &res); err != nil {
-		return err
-	}
-	*out.(*interface{}) = cleanupMapValue(res)
-
-	return nil
+// PipelineParserResult is the ordered parse tree of a Pipeline document
+type PipelineParserResult struct {
+	pipeline yaml.MapSlice
 }
 
-func cleanupInterfaceArray(in []interface{}) []interface{} {
-	res := make([]interface{}, len(in))
-	for i, v := range in {
-		res[i] = cleanupMapValue(v)
-	}
-	return res
+func (p *PipelineParserResult) MarshalJSON() ([]byte, error) {
+	return yamltojson.MarshalMapSliceJSON(p.pipeline)
 }
 
-func cleanupInterfaceMap(in map[interface{}]interface{}) map[string]interface{} {
-	res := make(map[string]interface{})
-	for k, v := range in {
-		res[fmt.Sprintf("%v", k)] = cleanupMapValue(v)
-	}
-	return res
+// topLevelStep is a custom type to support "step or string" which works around
+// an issue where ordered parsing of yaml doesn't work with a top-level slice
+type topLevelStep struct {
+	yaml.MapSlice
+	Body string
 }
 
-func cleanupMapValue(v interface{}) interface{} {
-	switch v := v.(type) {
-	case []interface{}:
-		return cleanupInterfaceArray(v)
-	case map[interface{}]interface{}:
-		return cleanupInterfaceMap(v)
-	case nil, bool, string, int, float64:
-		return v
-	default:
-		panic("Unhandled map type " + fmt.Sprintf("%T", v))
+func (s *topLevelStep) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	// Some steps are plain old strings like "wait". To avoid unmarshaling errors
+	// we check for plain old strings
+	if err := unmarshal(&s.Body); err == nil {
+		return nil
 	}
+	return unmarshal(&s.MapSlice)
 }

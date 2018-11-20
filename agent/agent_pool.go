@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/buildkite/agent/retry"
 	"github.com/buildkite/agent/signalwatcher"
 	"github.com/buildkite/agent/system"
+	"github.com/denisbrodbeck/machineid"
 )
 
 type AgentPool struct {
@@ -25,8 +27,10 @@ type AgentPool struct {
 	TagsFromEC2           bool
 	TagsFromEC2Tags       bool
 	TagsFromGCP           bool
+	TagsFromHost          bool
 	WaitForEC2TagsTimeout time.Duration
 	Endpoint              string
+	DisableHTTP2          bool
 	AgentConfiguration    *AgentConfiguration
 
 	interruptCount int
@@ -38,7 +42,11 @@ func (r *AgentPool) Start() error {
 	r.ShowBanner()
 
 	// Create the agent registration API Client
-	r.APIClient = APIClient{Endpoint: r.Endpoint, Token: r.Token}.Create()
+	r.APIClient = APIClient{
+		Endpoint:     r.Endpoint,
+		Token:        r.Token,
+		DisableHTTP2: r.DisableHTTP2,
+	}.Create()
 
 	// Create the agent template. We use pass this template to the register
 	// call, at which point we get back a real agent.
@@ -52,7 +60,8 @@ func (r *AgentPool) Start() error {
 		logger.Fatal("%s", err)
 	}
 
-	logger.Info("Successfully registered agent \"%s\" with tags %s", registered.Name, registered.Tags)
+	logger.Info("Successfully registered agent \"%s\" with tags [%s]", registered.Name,
+		strings.Join(registered.Tags, ", "))
 
 	logger.Debug("Ping interval: %ds", registered.PingInterval)
 	logger.Debug("Job status interval: %ds", registered.JobStatusInterval)
@@ -60,7 +69,12 @@ func (r *AgentPool) Start() error {
 
 	// Now that we have a registered agent, we can connect it to the API,
 	// and start running jobs.
-	worker := AgentWorker{Agent: registered, AgentConfiguration: r.AgentConfiguration, Endpoint: r.Endpoint}.Create()
+	worker := AgentWorker{
+		Agent:              registered,
+		AgentConfiguration: r.AgentConfiguration,
+		Endpoint:           r.Endpoint,
+		DisableHTTP2:       r.DisableHTTP2,
+	}.Create()
 
 	logger.Info("Connecting to Buildkite...")
 	if err := worker.Connect(); err != nil {
@@ -125,6 +139,13 @@ func (r *AgentPool) CreateAgentTemplate() *api.Agent {
 		Build:             BuildVersion(),
 		PID:               os.Getpid(),
 		Arch:              runtime.GOARCH,
+	}
+
+	// get a unique identifier for the underlying host
+	if machineID, err := machineid.ProtectedID("buildkite-agent"); err != nil {
+		logger.Warn("Failed to find unique machine-id: %v", err)
+	} else {
+		agent.MachineID = machineID
 	}
 
 	// Attempt to add the EC2 tags
@@ -205,6 +226,17 @@ func (r *AgentPool) CreateAgentTemplate() *api.Agent {
 	agent.OS, err = system.VersionDump()
 	if err != nil {
 		logger.Warn("Failed to find OS information: %s", err)
+	}
+
+	// Attempt to add the host tags
+	if r.TagsFromHost {
+		agent.Tags = append(agent.Tags,
+			fmt.Sprintf("hostname=%s", agent.Hostname),
+			fmt.Sprintf("os=%s", runtime.GOOS),
+		)
+		if agent.MachineID != "" {
+			agent.Tags = append(agent.Tags, fmt.Sprintf("machine-id=%s", agent.MachineID))
+		}
 	}
 
 	return agent

@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -36,17 +37,10 @@ func TestCheckingOutLocalGitProject(t *testing.T) {
 	git.ExpectAll([][]interface{}{
 		{"clone", "-v", "--", tester.Repo.Path, "."},
 		{"clean", "-fdq"},
-		{"submodule", "foreach", "--recursive", "git", "clean", "-fdq"},
 		{"fetch", "-v", "--prune", "origin", "master"},
 		{"checkout", "-f", "FETCH_HEAD"},
-		{"submodule", "sync", "--recursive"},
-		{"submodule", "update", "--init", "--recursive", "--force"},
-		{"submodule", "foreach", "--recursive", "git", "reset", "--hard"},
 		{"clean", "-fdq"},
-		{"submodule", "foreach", "--recursive", "git", "clean", "-fdq"},
-		{"submodule", "foreach", "--recursive", "git", "ls-remote", "--get-url"},
 		{"--no-pager", "show", "HEAD", "-s", "--format=fuller", "--no-color"},
-		{"--no-pager", "branch", "--contains", "HEAD", "--no-color"},
 	})
 
 	// Mock out the meta-data calls to the agent after checkout
@@ -57,8 +51,73 @@ func TestCheckingOutLocalGitProject(t *testing.T) {
 	agent.
 		Expect("meta-data", "set", "buildkite:git:commit", bintest.MatchAny()).
 		AndExitWith(0)
+
+	tester.RunAndCheck(t, env...)
+}
+
+func TestCheckingOutLocalGitProjectWithSubmodules(t *testing.T) {
+	t.Parallel()
+
+	// Git for windows seems to struggle with local submodules in the temp dir
+	if runtime.GOOS == `windows` {
+		t.Skip()
+	}
+
+	tester, err := NewBootstrapTester()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tester.Close()
+
+	submoduleRepo, err := createTestGitRespository()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer submoduleRepo.Close()
+
+	out, err := tester.Repo.Execute("submodule", "add", submoduleRepo.Path)
+	if err != nil {
+		t.Fatalf("Adding submodule failed: %s", out)
+	}
+
+	out, err = tester.Repo.Execute("commit", "-am", "Add example submodule")
+	if err != nil {
+		t.Fatalf("Committing submodule failed: %s", out)
+	}
+
+	env := []string{
+		"BUILDKITE_GIT_CLONE_FLAGS=-v",
+		"BUILDKITE_GIT_CLEAN_FLAGS=-fdq",
+	}
+
+	// Actually execute git commands, but with expectations
+	git := tester.
+		MustMock(t, "git").
+		PassthroughToLocalCommand()
+
+	// But assert which ones are called
+	git.ExpectAll([][]interface{}{
+		{"clone", "-v", "--", tester.Repo.Path, "."},
+		{"clean", "-fdq"},
+		{"submodule", "foreach", "--recursive", "git", "clean", "-fdq"},
+		{"fetch", "-v", "--prune", "origin", "master"},
+		{"checkout", "-f", "FETCH_HEAD"},
+		{"submodule", "sync", "--recursive"},
+		{"submodule", "update", "--init", "--recursive", "--force"},
+		{"submodule", "foreach", "--recursive", "git", "reset", "--hard"},
+		{"clean", "-fdq"},
+		{"submodule", "foreach", "--recursive", "git", "clean", "-fdq"},
+		{"submodule", "foreach", "--recursive", "git", "ls-remote", "--get-url"},
+		{"--no-pager", "show", "HEAD", "-s", "--format=fuller", "--no-color"},
+	})
+
+	// Mock out the meta-data calls to the agent after checkout
+	agent := tester.MustMock(t, "buildkite-agent")
 	agent.
-		Expect("meta-data", "set", "buildkite:git:branch", bintest.MatchAny()).
+		Expect("meta-data", "exists", "buildkite:git:commit").
+		AndExitWith(1)
+	agent.
+		Expect("meta-data", "set", "buildkite:git:commit", bintest.MatchAny()).
 		AndExitWith(0)
 
 	tester.RunAndCheck(t, env...)
@@ -81,11 +140,6 @@ func TestCheckingOutSetsCorrectGitMetadataAndSendsItToBuildkite(t *testing.T) {
 	agent.
 		Expect("meta-data", "set", "buildkite:git:commit",
 			bintest.MatchPattern(`^commit`)).
-		AndExitWith(0)
-
-	agent.
-		Expect("meta-data", "set", "buildkite:git:branch",
-			bintest.MatchPattern(`^\* \(HEAD detached at FETCH_HEAD\)`)).
 		AndExitWith(0)
 
 	tester.RunAndCheck(t)

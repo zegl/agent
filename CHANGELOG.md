@@ -4,6 +4,140 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [v3.5.4](https://github.com/buildkite/agent/tree/v3.5.4) (2018-10-24)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.5.3...v3.5.4)
+
+### Fixed
+- Prevent docker image from crashing with missing config error [#847](https://github.com/buildkite/agent/pull/847) (@lox)
+
+## [v3.5.3](https://github.com/buildkite/agent/tree/v3.5.3) (2018-10-24)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.5.2...v3.5.3)
+
+### Fixed
+- Update to alpine to 3.8 in docker image [#842](https://github.com/buildkite/agent/pull/842) (@lox)
+- Set BUILDKITE_AGENT_CONFIG in docker images to /buildkite [#834](https://github.com/buildkite/agent/pull/834) (@blakestoddard)
+- Fix agent panics on ARM architecture [#831](https://github.com/buildkite/agent/pull/831) (@jhedev)
+
+## [v3.5.2](https://github.com/buildkite/agent/tree/v3.5.2) (2018-10-09)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.5.1...v3.5.2)
+
+### Changed
+- Fix issue where pipelines with a top-level array of steps failed [#830](https://github.com/buildkite/agent/pull/830) (@lox)
+
+## [v3.5.1](https://github.com/buildkite/agent/tree/v3.5.1) (2018-10-08)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.5.0...v3.5.1)
+
+### Fixed
+- Ensure plugin directory exists, otherwise checkout lock thrashes [#828](https://github.com/buildkite/agent/pull/828) (@lox)
+
+## [v3.5.0](https://github.com/buildkite/agent/tree/v3.5.0) (2018-10-08)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.4.0...v3.5.0)
+
+### Fixed
+- Add plugin locking before checkout [#827](https://github.com/buildkite/agent/pull/827) (@lox)
+- Ensure pipeline parser maintains map order in output [#824](https://github.com/buildkite/agent/pull/824) (@lox)
+- Update aws sdk [#818](https://github.com/buildkite/agent/pull/818) (@sj26)
+- Fix boostrap typo [#814](https://github.com/buildkite/agent/pull/814) (@ChefAustin)
+
+### Changed
+- `annotate` takes body as an arg, or reads from a pipe [#813](https://github.com/buildkite/agent/pull/813) (@sj26)
+- Respect pre-set BUILDKITE_BUILD_CHECKOUT_PATH [#806](https://github.com/buildkite/agent/pull/806) (@lox)
+- Add time since last successful heartbeat/ping [#810](https://github.com/buildkite/agent/pull/810) (@lox)
+- Updating launchd templates to only restart on error [#804](https://github.com/buildkite/agent/pull/804) (@lox)
+- Allow more time for systemd graceful stop [#819](https://github.com/buildkite/agent/pull/819) (@lox)
+
+## [v3.4.0](https://github.com/buildkite/agent/tree/v3.4.0) (2018-07-18)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.3.0...v3.4.0)
+
+### Changed
+- Add basic plugin definition parsing [#748](https://github.com/buildkite/agent/pull/748) (@lox)
+- Allow specifying which phases bootstrap should execute [#799](https://github.com/buildkite/agent/pull/799) (@lox)
+- Warn in bootstrap when protected env are used [#796](https://github.com/buildkite/agent/pull/796) (@lox)
+- Cancellation on windows kills bootstrap subprocesses [#795](https://github.com/buildkite/agent/pull/795) (@amitsaha)
+
+## [v3.3.0](https://github.com/buildkite/agent/tree/v3.3.0) (2018-07-11)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.2.1...v3.3.0)
+
+### Added
+- Allow tags from the host to be automatically added with --add-host-tags [#791](https://github.com/buildkite/agent/pull/791) (@lox)
+- Allow --no-plugins=false to force plugins on [#790](https://github.com/buildkite/agent/pull/790) (@lox)
+
+## [v3.2.1](https://github.com/buildkite/agent/tree/v3.2.1) (2018-06-28)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.2.0...v3.2.1)
+
+### Changed
+- Remove the checkout dir when git clean fails [#786](https://github.com/buildkite/agent/pull/786) (@lox)
+- Add a --dry-run to pipeline upload that dumps json [#781](https://github.com/buildkite/agent/pull/781) (@lox)
+- Support PTY under OpenBSD [#785](https://github.com/buildkite/agent/pull/785) (@derekmarcotte) [#787](https://github.com/buildkite/agent/pull/787) (@derekmarcotte)
+- Experiments docs and experiment cleanup [#771](https://github.com/buildkite/agent/pull/771) (@lox)
+
+## [v3.2.0](https://github.com/buildkite/agent/tree/v3.2.0) (2018-05-25)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.1.2...v3.2.0)
+
+### Changed
+- Propagate exit code > 1 out of failing hooks [#768](https://github.com/buildkite/agent/pull/768) (@lox)
+- Fix broken list parsing in cli arguments --tags and --experiments [#772](https://github.com/buildkite/agent/pull/772) (@lox)
+- Add a virtual provides to the RPM package [#737](https://github.com/buildkite/agent/pull/737) (@jnewbigin)
+- Clean up docker image building [#755](https://github.com/buildkite/agent/pull/755) (@lox)
+- Don't trim whitespace from the annotation body [#766](https://github.com/buildkite/agent/pull/766) (@petemounce)
+
+## [v3.1.2](https://github.com/buildkite/agent/tree/v3.1.2) (2018-05-10)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.1.1...v3.1.2)
+
+### Changed
+- Experiment: Pass jobs an authenticated unix socket rather than an access token  [#759](https://github.com/buildkite/agent/pull/759) (@lox)
+- Remove buildkite:git:branch meta-data [#753](https://github.com/buildkite/agent/pull/753) (@sj26)
+- Set TERM and PWD for commands that get executed in shell [#751](https://github.com/buildkite/agent/pull/751) (@lox)
+
+### Fixed
+- Avoid pausing after job has finished [#764](https://github.com/buildkite/agent/pull/764) (@sj26)
+
+## [v3.1.1](https://github.com/buildkite/agent/tree/v3.1.1) (2018-05-02)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.1.0...v3.1.1)
+
+### Fixed
+- Fix stdin detection for output redirection [#750](https://github.com/buildkite/agent/pull/750) (@lox)
+
+## [v3.1.0](https://github.com/buildkite/agent/tree/v3.1.0) (2018-05-01)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.0.1...v3.1.0)
+
+### Changed
+- Add ubuntu docker image [#749](https://github.com/buildkite/agent/pull/749) (@lox)
+- Support `--no-interpolation` option in `pipeline upload` [#733](https://github.com/buildkite/agent/pull/733) (@lox)
+- Bump our Docker image base to alpine v3.7 [#745](https://github.com/buildkite/agent/pull/745) (@sj26)
+- Better error for multiple file args to artifact upload [#740](https://github.com/buildkite/agent/pull/740) (@toolmantim)
+
+## [v3.0.1](https://github.com/buildkite/agent/tree/v3.0.1) (2018-04-17)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.0.0...v3.0.1)
+
+### Changed
+- Don't set Content-Encoding on s3 upload [#732] (@lox)
+
+## [v3.0.0](https://github.com/buildkite/agent/tree/v3.0.0) (2018-04-03)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.0-beta.44...v3.0.0)
+
+No changes
+
+## [v3.0-beta.44](https://github.com/buildkite/agent/tree/v3.0-beta.44) (2018-04-03)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.0-beta.43...v3.0-beta.44)
+
+### Fixed
+- Normalize the `bootstrap-script` command using a new `commandpath` normalization [#714](https://github.com/buildkite/agent/pull/714) (@keithpitt)
+
+### Changed
+- Install windows binary to c:\buildkite-agent\bin [#713](https://github.com/buildkite/agent/pull/713) (@lox)
+
+## [v3.0-beta.43](https://github.com/buildkite/agent/tree/v3.0-beta.43) (2018-04-03)
+[Full Changelog](https://github.com/buildkite/agent/compare/v3.0-beta.42...v3.0-beta.43)
+
+### Changed
+- Prettier bootstrap output 💅🏻 [#708](https://github.com/buildkite/agent/pull/708) (@lox)
+- Only run git submodule operations if there is a .gitmodules [#704](https://github.com/buildkite/agent/pull/704) (@lox)
+- Add an agent config for no-local-hooks [#707](https://github.com/buildkite/agent/pull/707) (@lox)
+- Build docker image as part of agent pipeline [#701](https://github.com/buildkite/agent/pull/701) (@lox)
+- Windows install script [#699](https://github.com/buildkite/agent/pull/699) (@lox)
+- Expose no-git-submodules config and arg to start [#698](https://github.com/buildkite/agent/pull/698) (@lox)
+
 ## [v3.0-beta.42](https://github.com/buildkite/agent/tree/v3.0-beta.42) (2018-03-20)
 [Full Changelog](https://github.com/buildkite/agent/compare/v3.0-beta.41...v3.0-beta.42)
 
